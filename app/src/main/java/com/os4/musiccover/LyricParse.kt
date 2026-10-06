@@ -341,7 +341,7 @@ object LyricParse {
      * first to sing is on the left, the second on the right, and the prefix is not shown. A file
      * whose lines already say which side they are on (TTML's agents) is left as it is.
      */
-    private fun speakers(lines: List<LyricLine>): List<LyricLine> {
+    internal fun speakers(lines: List<LyricLine>): List<LyricLine> {
         if (lines.any { it.opposite }) return lines
         val labels = lines.map { LABEL.find(it.text)?.groupValues?.get(1) }
         val counts = labels.filterNotNull().groupingBy { it }.eachCount()
