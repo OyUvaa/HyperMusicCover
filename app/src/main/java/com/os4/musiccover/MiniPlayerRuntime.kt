@@ -152,6 +152,27 @@ object MiniPlayerRuntime {
                 }
             }.onFailure { Xp.w("MCMini: transient hold unavailable on $name: $it") }
         }
+        runCatching {
+            val cls = Xp.findClass(
+                "com.android.systemui.statusbar.notification.stack.NotificationStackScrollLayoutControllerInjectorImpl",
+                classLoader)
+            Xp.hookAll(cls, "updateStackingBottomForMiui") { chain ->
+                val args = chain.args.toTypedArray()
+                val bottom = args.getOrNull(0) as? Float
+                if (bottom == null) chain.proceed() else {
+                    boundsInjector = WeakReference(chain.thisObject)
+                    boundsBottom = bottom
+                    args[0] = notificationBottom(chain.thisObject, bottom).also { boundsGiven = it }
+                    val result = chain.proceed(args)
+                    if (floorMoving) {
+                        floorMoving = false
+                        runCatching { Xp.getObjectField(chain.thisObject, "layout") as? View }
+                            .getOrNull()?.let(::restack)
+                    }
+                    result
+                }
+            }
+        }.onFailure { Xp.w("MCMini: stacking bottom hook unavailable, cards may meet a lifted row: $it") }
         MiniPlayerScene.install(classLoader)
         installCardMaterialHooks(classLoader)
         runCatching { installAodDim(classLoader) }
@@ -250,6 +271,73 @@ object MiniPlayerRuntime {
             .invoke(null, context) as android.graphics.Rect
         return android.graphics.Rect(rect).takeUnless { it.isEmpty }
     }
+
+    /**
+     * The keyguard's stack piles its cards down to a bottom SystemUI gives it
+     * (NotificationStackScrollLayoutControllerInjectorImpl.updateStackingBottomForMiui, from the
+     * notification container's bounds) - on this phone 2257, a fixed distance above the screen's
+     * foot, the sensor nowhere in it. The row lifted off a low sensor went up into that room, and
+     * the media card at the bottom of the pile drew over it. So that bottom is kept above the
+     * lifted row: the pile, the list's scroll range and the stack's touches all read it. Only on
+     * the lock screen - the shade takes the same bottom, and floored there lost the touches and
+     * the scroll below the floor - and kept while the lift is on, the row shown or not: a floor
+     * that came and went with the row moved every card on the lock screen with it.
+     */
+    private var boundsInjector: WeakReference<Any>? = null
+    /** The bottom SystemUI gave last, and what it was given instead; NaN until it gave one. */
+    private var boundsBottom = Float.NaN
+    private var boundsGiven = Float.NaN
+    /** The bottom was given again for the lift: the stack is laid out again, animated, once it has it. */
+    private var floorMoving = false
+
+    /** Asked inside SystemUI's own call: anything going wrong gives SystemUI's bottom back. */
+    private fun notificationBottom(injector: Any, bottom: Float): Float = runCatching {
+        if (!showingKeyguardNotifications(injector)) return@runCatching bottom
+        val floor = live().firstNotNullOfOrNull { it.stackFloor() } ?: return@runCatching bottom
+        min(bottom, floor)
+    }.getOrElse {
+        Xp.w("MCMini: notification bottom left to SystemUI: $it")
+        bottom
+    }
+
+    /** SystemUI's own test in updateStackingBottomForMiui for the stack being the lock screen's. */
+    private fun showingKeyguardNotifications(injector: Any): Boolean {
+        val lazy = Xp.getObjectField(injector, "notifContainerViewModel")
+        val model = Xp.callMethod(lazy!!, "get")
+        return Xp.callMethod(Xp.callMethod(model!!, "isShowingKeyguardNotification")!!, "getValue") == true
+    }
+
+    /** The lift's floor, or the lack of one, given to SystemUI if it is not what it has. */
+    internal fun checkStackFloor() {
+        val injector = boundsInjector?.get() ?: return
+        if (boundsBottom.isNaN()) return
+        if (kotlin.math.abs(notificationBottom(injector, boundsBottom) - boundsGiven) < 1f) return
+        floorMoving = true
+        runCatching { Xp.callMethod(injector, "updateStackingBottomForMiui", boundsBottom) }
+            .onFailure { floorMoving = false; Xp.w("MCMini: notification bottom not given again: $it") }
+        Xp.log("MCMini: notification bottom ${boundsBottom.toInt()} -> ${boundsGiven.toInt()}")
+    }
+
+    /**
+     * The stack laid out again for a new bottom, as for a new top padding: its own animation
+     * (the top padding event takes every row to its new place). Only the field is set otherwise,
+     * and the rows stayed where they were until something else moved them.
+     */
+    private fun restack(stack: View) {
+        runCatching {
+            if (Xp.getObjectField(stack, "mAnimationsEnabled") == true && Xp.getObjectField(stack, "mIsExpanded") == true) {
+                Xp.setBooleanField(stack, "mTopPaddingNeedsAnimation", true)
+                Xp.setBooleanField(stack, "mNeedsAnimation", true)
+            }
+        }.onFailure { Xp.log("MCMini: stack moves to its new bottom unanimated: $it") }
+        runCatching { Xp.callMethod(stack, "requestChildrenUpdate") }
+            .onFailure { Xp.w("MCMini: stack not laid out for its new bottom: $it") }
+    }
+
+    /** For `op fod`. */
+    private fun describeStackFloor(): String =
+        "notifBottom sysui=${boundsBottom.toInt()} given=${boundsGiven.toInt()}" +
+            (if (boundsInjector?.get() == null) " (not given yet)" else "")
 
     /**
      * Bumped whenever the card is dressed differently; part of the pill's appearance key. Not on
@@ -1441,7 +1529,8 @@ object MiniPlayerRuntime {
         fodReadAt = 0L
         val rows = live()
         rows.forEach { it.relayout() }
-        return note + "probe=${fodProbe ?: "off"} || " +
+        checkStackFloor()
+        return note + "probe=${fodProbe ?: "off"} || " + describeStackFloor() + " || " +
             rows.joinToString(" || ") { it.describeFingerprint() }.ifEmpty { "no controller" }
     }
 
@@ -8789,6 +8878,9 @@ private class MiniPlayerController(
     fun refresh() {
         if (Looper.myLooper() != Looper.getMainLooper()) { scheduleRefresh(); return }
         runCatching { refreshUnsafe() }.onFailure { Xp.w("MCMini: refresh failed: $it") }
+        // The lift switched on or off in the settings comes here, not to position().
+        runCatching { MiniPlayerRuntime.checkStackFloor() }
+            .onFailure { Xp.w("MCMini: notification bottom check failed: $it") }
     }
 
     private fun scheduleRefresh() {
@@ -10189,6 +10281,39 @@ private class MiniPlayerController(
 
     private var fodLiftedTo = Float.NaN
 
+    /**
+     * Where the keyguard's notifications must end for the row lifted off the sensor - the lifted
+     * row's top less the same margin it keeps from the sensor - in the stack's own coordinates,
+     * as SystemUI's stacking bottom is; null with the row not lifted (MiniPlayerRuntime.
+     * notificationBottom). Whether the row is shown does not count.
+     */
+    fun stackFloor(): Float? {
+        if (host.width <= 0 || host.height <= 0) return null
+        if (!config.optBoolean(MiniPlayerConfig.FOD_LIFT, true)) return null
+        val l = if (placesRow(left)) restCentre(left) else null
+        val r = if (placesRow(right)) restCentre(right) else null
+        val height = dp(MiniPlayerConfig.visibleHeightDp(config.toString()))
+        val natural = rowCentreY(l, r, height)
+        val lifted = clearOfFingerprint(natural, height, l, r)
+        if (lifted >= natural) return null
+        val stackTop = stackTopInHost() ?: return null
+        return lifted - height / 2f - dp(FOD_MARGIN_DP) - stackTop
+    }
+
+    /**
+     * The stack's top in the host, as laid out: SystemUI's bottom is a layout position, and the
+     * swipes and the unlock translate the stack's parents.
+     */
+    private fun stackTopInHost(): Float? {
+        var v: View = notificationStack() ?: return null
+        var y = 0f
+        while (v !== host) {
+            y += v.top
+            v = v.parent as? View ?: return null
+        }
+        return y
+    }
+
     /** The sensor in the host's coordinates, or null. */
     private fun fingerprintInHost(): android.graphics.Rect? {
         val fod = MiniPlayerRuntime.fingerprintArea(context) ?: return null
@@ -10229,6 +10354,8 @@ private class MiniPlayerController(
     }
 
     private fun position() {
+        // The buttons laid out again may have moved the floor; the pill need not be up for it.
+        runCatching { MiniPlayerRuntime.checkStackFloor() }
         val view = player ?: return
         if (view.visibility != View.VISIBLE || spread != null) return
         val small = smallKey != null
