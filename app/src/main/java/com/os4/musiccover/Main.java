@@ -2770,14 +2770,28 @@ public class Main extends XposedModule {
                         MiniPlayerRuntime.applyConfig(c, i.getStringExtra("json"));
                         saveState();
                     } else if ("pickup".equals(op)) {
-                        // 取餐码: --ez on true|false from the app; --es do read for one read
-                        // now; the state as the result either way.
+                        // 取餐码: --ez on true|false from the app; --es do read for one read now;
+                        // --es do vdtest [--ei task N] [--ei min M] for the hidden display's
+                        // experiment (§6 of 取餐码方案.md); --es do vdoff to put it back. The state
+                        // of both halves is the result either way.
                         if (i.hasExtra("on")) {
                             PickupCodeIsland.INSTANCE.setOn(i.getBooleanExtra("on", true));
                             saveState();
                         }
-                        if ("read".equals(i.getStringExtra("do"))) PickupCodeIsland.INSTANCE.readNow();
-                        setResultData(PickupCodeIsland.INSTANCE.describe());
+                        String doIt = i.getStringExtra("do");
+                        if ("read".equals(doIt)) PickupCodeIsland.INSTANCE.readNow();
+                        if ("vdtest".equals(doIt)) {
+                            int task = i.getIntExtra("task", PickupCodeIsland.INSTANCE.trackedTask());
+                            if (task < 0) setResultData("no task: open the order page first");
+                            else setResultData(PickupPark.INSTANCE.experiment(task,
+                                    i.getIntExtra("min", 5), 0));
+                        } else if ("vdoff".equals(doIt)) {
+                            PickupPark.INSTANCE.releaseFrom("the probe said so");
+                            setResultData(PickupPark.INSTANCE.describe());
+                        } else {
+                            setResultData(PickupCodeIsland.INSTANCE.describe()
+                                    + " | " + PickupPark.INSTANCE.describe());
+                        }
                     } else if ("transitcfg".equals(op)) {
                         // 「高德公交地铁」: --ez on true|false from the app; without it, 高德
                         // asking as it starts (AmapImmerse), and told what it is.
