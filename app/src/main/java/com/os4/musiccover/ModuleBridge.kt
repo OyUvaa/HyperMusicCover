@@ -744,6 +744,40 @@ object ModuleBridge {
             }
         }
 
+    /** A subway commute 小爱建议's ride-code island has learned (MetroCommute). */
+    class CommuteRoute(val start: String, val changes: List<String>, val end: String, val trips: Int)
+
+    /** What 小爱建议 says it has learned; [reached] false when it did not answer (not running). */
+    data class Commute(
+        val reached: Boolean = false,
+        val learning: Boolean = false,
+        val trips: Int = 0,
+        val routes: List<CommuteRoute> = emptyList(),
+    )
+
+    /**
+     * Asks the ride-code island in 小爱建议 directly - the commutes live there, not in SystemUI -
+     * and, with [what] `learn` or `forget`, changes them first. [on] is for `learn`.
+     */
+    suspend fun commute(context: Context, what: String = "commute", on: Boolean = true): Commute {
+        val i = Intent(MetroCodeIsland.ACTION_TRIP).setPackage(MetroCodeIsland.PKG)
+            .putExtra("do", what)
+            .putExtra("on", on)
+        val r = broadcast(context.applicationContext, i) ?: return Commute()
+        val b = r.extras
+        if (r.code != 1 || b == null || !b.getBoolean("loaded")) return Commute()
+        val starts = b.getStringArray("starts").orEmpty()
+        val changes = b.getStringArray("changes").orEmpty()
+        val ends = b.getStringArray("ends").orEmpty()
+        val counts = b.getIntArray("counts") ?: IntArray(0)
+        val routes = starts.indices.mapNotNull { k ->
+            CommuteRoute(starts[k],
+                changes.getOrNull(k).orEmpty().split(',').filter { it.isNotEmpty() },
+                ends.getOrNull(k) ?: return@mapNotNull null, counts.getOrElse(k) { 0 })
+        }
+        return Commute(true, b.getBoolean("learning"), b.getInt("trips"), routes)
+    }
+
     private fun fromBundle(b: Bundle?): State {
         if (b == null || !b.getBoolean("alive", false)) return State()
         return State(

@@ -192,6 +192,14 @@
     <string name="features_transit_title">Amap bus &amp; subway</string>
     <string name="features_transit_summary">Stop-by-stop island</string>
     <string name="transit_enabled">Enable Amap bus &amp; subway</string>
+    <string name="commute_title">Subway commute</string>
+    <string name="commute_learn">Learn commutes</string>
+    <string name="commute_learn_summary">Remembers the starts, ends and changes you ride often, so the ride code also comes up at changes and arrival without navigation. Station names and times only, kept on this phone, deleted after 30 days</string>
+    <string name="commute_unreached">XiaoAi Suggestions is not running. Open the minus-one screen once, then come back</string>
+    <string name="commute_route_direct">Direct · %1$d trips</string>
+    <string name="commute_route_via">Change at %1$s · %2$d trips</string>
+    <string name="commute_forget">Forget commutes</string>
+    <string name="commute_forget_summary">%1$d trips kept</string>
 
     <string name="shade_enabled">Enable flowing light</string>
     <string name="shade_section_behaviour">Behaviour</string>

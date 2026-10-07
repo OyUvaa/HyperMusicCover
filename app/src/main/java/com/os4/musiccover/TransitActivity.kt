@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -21,6 +22,8 @@ import androidx.compose.ui.unit.dp
 import com.os4.musiccover.ui.screen.features.TransitDemo
 import com.os4.musiccover.ui.theme.AppTheme
 import com.os4.musiccover.ui.util.PageScaffold
+import kotlinx.coroutines.launch
+import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.preference.SwitchPreference
@@ -103,6 +106,9 @@ private fun TransitPage(blur: Boolean, refreshKey: Int, onBack: () -> Unit) {
             }
         }
         item {
+            CommuteSection(refreshKey)
+        }
+        item {
             SmallTitle(text = stringResource(R.string.pickup_title), modifier = Modifier.padding(top = 12.dp))
             Card(Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
                 SwitchPreference(title = stringResource(R.string.pickup_enabled),
@@ -113,6 +119,50 @@ private fun TransitPage(blur: Boolean, refreshKey: Int, onBack: () -> Unit) {
                         ModuleBridge.setPickup(context, it)
                     })
             }
+        }
+    }
+}
+
+/**
+ * The subway commutes the ride-code island learns (MetroCommute, in 小爱建议): whether it learns,
+ * what it has learned, and forgetting it. Asked of 小爱建议 itself, which keeps them.
+ */
+@Composable
+private fun CommuteSection(refreshKey: Int) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var state by remember { mutableStateOf(ModuleBridge.Commute()) }
+    var asked by remember { mutableStateOf(false) }
+    LaunchedEffect(refreshKey) {
+        state = ModuleBridge.commute(context)
+        asked = true
+    }
+    SmallTitle(text = stringResource(R.string.commute_title), modifier = Modifier.padding(top = 12.dp))
+    Card(Modifier.padding(horizontal = 12.dp)) {
+        SwitchPreference(title = stringResource(R.string.commute_learn),
+            summary = if (asked && !state.reached) {
+                stringResource(R.string.commute_unreached)
+            } else {
+                stringResource(R.string.commute_learn_summary)
+            },
+            checked = state.reached && state.learning, enabled = state.reached,
+            onCheckedChange = { on ->
+                state = state.copy(learning = on)
+                scope.launch { state = ModuleBridge.commute(context, "learn", on) }
+            })
+        for (r in state.routes) {
+            val via = r.changes.joinToString("、")
+            BasicComponent(title = r.start + " → " + r.end,
+                summary = if (via.isEmpty()) {
+                    stringResource(R.string.commute_route_direct, r.trips)
+                } else {
+                    stringResource(R.string.commute_route_via, via, r.trips)
+                })
+        }
+        if (state.reached && state.trips > 0) {
+            BasicComponent(title = stringResource(R.string.commute_forget),
+                summary = stringResource(R.string.commute_forget_summary, state.trips),
+                onClick = { scope.launch { state = ModuleBridge.commute(context, "forget") } })
         }
     }
 }
