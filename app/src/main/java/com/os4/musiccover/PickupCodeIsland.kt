@@ -68,10 +68,13 @@ internal object PickupCodeIsland {
 
     /** The mini programs read, matched in the task label. */
     private val BRANDS = listOf(
-        "瑞幸", "luckin", "喜茶", "霸王茶姬", "蜜雪冰城", "库迪", "古茗", "茶百道", "沪上阿姨", "书亦",
-        "一点点", "CoCo", "都可", "奈雪", "七分甜", "益禾堂", "柠季", "茶颜悦色", "星巴克", "Manner",
-        "挪瓦", "Tims", "麦当劳", "肯德基", "汉堡王", "塔斯汀", "华莱士", "必胜客", "德克士", "老乡鸡",
-        "袁记", "Peet",
+        // ColorOS's own (Gleaner, assets/observeAgent/applet-wechat-observe-config.json, v5) ...
+        "麦当劳", "肯德基", "瑞幸", "奈雪", "霸王茶姬", "CoCo", "茶百道", "古茗", "沪上阿姨", "书亦",
+        "益禾堂", "1点点", "幸运咖", "挪瓦", "NOWWA", "库迪", "喜茶", "甜啦啦", "M Stand", "Manner",
+        "太平洋咖啡", "星巴克", "去茶山", "kuddo", "阿嬷手作", "peet", "混果汁", "konomi", "丘大叔", "华莱士",
+        // ... and more of the same kind.
+        "luckin", "蜜雪冰城", "一点点", "都可", "七分甜", "柠季", "茶颜悦色", "Tims", "汉堡王", "塔斯汀",
+        "必胜客", "德克士", "老乡鸡", "袁记",
     )
 
     /** The settings switch, kept with Main's state. On unless turned off. */
@@ -354,7 +357,9 @@ internal object PickupCodeIsland {
         }
         val pic = icon(c, task)
         val title = r.status ?: r.label
-        val content = listOfNotNull(brand, r.store).joinToString(" · ")
+        // 「麦当劳示例广场餐厅」 under 麦当劳 is 「示例广场餐厅」.
+        val store = r.store?.removePrefix(brand)?.trimStart('（', '(', ' ')?.ifEmpty { null }
+        val content = listOfNotNull(brand, store).joinToString(" · ")
         val island = JSONObject()
             .put("islandProperty", 1)
             .put("islandPriority", 2)

@@ -36,6 +36,32 @@ class PickupParseTest {
     }
 
     @Test
+    fun mcdCallsItsCodeTheOrderNumber() {
+        // 订单号 / 35516, with the real order number under 订单编码 further down.
+        val r = PickupParse.parse(page("mcd"))!!
+        assertEquals("35516", r.code)
+        assertEquals("订单号", r.label)
+        assertEquals("已准备完毕", r.status)
+        assertEquals("麦当劳示例广场餐厅", r.store)
+    }
+
+    @Test
+    fun aStrongLabelBeatsAnEarlierWeakOne() {
+        val r = PickupParse.parse(n("订单号", "123456", "取餐号", "A12"))!!
+        assertEquals("A12", r.code)
+    }
+
+    @Test
+    fun aWeakLabelWithALongNumberIsNoCode() {
+        assertNull(PickupParse.parse(n("订单号", "2091126703119405058")))
+    }
+
+    @Test
+    fun theHashIsNotPartOfTheCode() {
+        assertEquals("123", PickupParse.parse(n("取餐码", "#123"))!!.code)
+    }
+
+    @Test
     fun aPageBehindIsNotRead() {
         // The order list (page 2) lies under the order (page 3); without page 3 there is no code.
         val listOnly = page("mixue").filter { it.page < 3 }
