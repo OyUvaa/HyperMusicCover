@@ -1,0 +1,443 @@
+package com.os4.musiccover
+
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.assist.AssistStructure
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.Icon
+import android.os.Binder
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Parcel
+import android.os.SystemClock
+import org.json.JSONObject
+
+/**
+ * A 微信 order page's pickup code, as a focus island - ColorOS's 取餐码 (Gleaner's observeagent),
+ * the part of it that needs no background display: the code is read while the page is open.
+ *
+ * ColorOS reads the page with ViewExtract, its own framework code inside 微信's process. Here it
+ * is the assist structure, asked for from SystemUI (which holds GET_TOP_ACTIVITY_INFO) by task:
+ * IActivityTaskManager.requestAssistDataForTask. A mini program is an XWeb WebView, and its DOM
+ * text comes back in the structure - 755 and 823 nodes on two real order pages, 5-17 ms - with
+ * nothing hooked in 微信 and no accessibility service. [PickupParse] finds the code in it.
+ *
+ * Only the mini programs [BRANDS] names are read, by the task's own label (the mini program's
+ * name, 「霸王茶姬」); ColorOS's list is cloud config by appId, which SystemUI is not handed. While
+ * one is in front it is read a second after it arrives and every [EVERY] ms after, as the
+ * order list and the order are pages of one task and moving between them changes nothing
+ * SystemUI hears. A code found is shown whatever the order's state; the island goes [LIFE] after
+ * the code was last seen, or when swiped away (that code is then not shown again for [LIFE]).
+ */
+internal object PickupCodeIsland {
+
+    private const val TAG = "MCPickup: "
+    private const val SYSUI = "com.android.systemui"
+    private const val WECHAT = "com.tencent.mm"
+    private const val MINI = "com.tencent.mm.plugin.appbrand.ui.AppBrandUI"
+    private const val TOP_OBSERVER = "com.miui.systemui.functions.MiuiTopActivityObserver"
+
+    private const val ID = 1241
+    private const val CHANNEL = "mc_pickup"
+    private const val PIC = "miui.focus.pic_mc_pickup"
+    private const val ACTION_OPEN = "com.os4.musiccover.PICKUP_OPEN"
+    private const val ACTION_GONE = "com.os4.musiccover.PICKUP_GONE"
+
+    private const val FIRST = 1_000L
+    /** Reads after the first that come quickly, a page just brought back may still be filling. */
+    private const val QUICK = 2
+    private const val QUICK_GAP = 1_000L
+    private const val RETRIES = 10
+    private const val RETRY_GAP = 300L
+    private const val EVERY = 5_000L
+    /** Reads of one stay in front, at most: an hour at [EVERY]. */
+    private const val MAX_READS = 720
+    private const val LIFE = 30 * 60_000L
+    private const val TIMEOUT = 3_000L
+
+    /** The mini programs read, matched in the task label. */
+    private val BRANDS = listOf(
+        "瑞幸", "luckin", "喜茶", "霸王茶姬", "蜜雪冰城", "库迪", "古茗", "茶百道", "沪上阿姨", "书亦",
+        "一点点", "CoCo", "都可", "奈雪", "七分甜", "益禾堂", "柠季", "茶颜悦色", "星巴克", "Manner",
+        "挪瓦", "Tims", "麦当劳", "肯德基", "汉堡王", "塔斯汀", "华莱士", "必胜客", "德克士", "老乡鸡",
+        "袁记", "Peet",
+    )
+
+    /** The settings switch, kept with Main's state. On unless turned off. */
+    @JvmField var sOn = true
+
+    private val bg: Handler by lazy { Handler(HandlerThread("mc-pickup").apply { start() }.looper) }
+
+    // All below on [bg].
+    private var lastTop: ComponentName? = null
+    private var taskId = -1
+    private var brand = ""
+    private var reads = 0
+    private var gen = 0
+    private var shownKey: String? = null
+    private var shownTask = -1
+    private var muted: String? = null
+    private var mutedUntil = 0L
+    private var receivers = false
+    private var lastRead = ""
+    /** The front page's first texts when no code was found, for the probe only (not logged). */
+    private var lastHead = ""
+    private var iconSaid = false
+
+    fun install(cl: ClassLoader) {
+        runCatching {
+            Xp.hookAll(Xp.findClass(TOP_OBSERVER, cl), "updateTopActivity") { chain ->
+                val out = chain.proceed()
+                runCatching {
+                    val state = Xp.getObjectField(chain.thisObject, "mState")
+                    val top = Xp.getObjectField(state, "topActivity") as? ComponentName
+                    bg.post { front(top) }
+                }
+                out
+            }
+            Xp.log(TAG + "watching the front activity")
+        }.onFailure { Xp.log(TAG + "front activity not watched: $it") }
+    }
+
+    fun setOn(on: Boolean) {
+        sOn = on
+        bg.post { if (!on) { stop(); takeDown("switched off") } }
+    }
+
+    fun describe(): String = "on=$sOn task=$taskId brand=$brand reads=$reads shown=${shownKey != null}" +
+        " last=$lastRead" + if (lastHead.isEmpty()) "" else " head=[$lastHead]"
+
+    /** The probe's `do=read`: one read now, of whatever is tracked. */
+    fun readNow() = bg.post { if (taskId >= 0) read(taskId, gen) }
+
+    /**
+     * [top] is MiuiTopActivityObserver's, which can be ahead of the task list: the task it names
+     * may not be listed yet, or not carry its label yet (微信 sets a mini program's label once
+     * the mini program is up). Looked for again then, [RETRIES] times.
+     */
+    private fun front(top: ComponentName?, retry: Int = 0) {
+        if (retry == 0) {
+            if (top == lastTop) return
+            lastTop = top
+        } else if (top != lastTop) {
+            return
+        }
+        if (!sOn || top == null || top.packageName != WECHAT || !top.className.startsWith(MINI)) {
+            stop()
+            return
+        }
+        val ctx = Main.appContext() ?: return
+        @Suppress("DEPRECATION")
+        val info = runCatching {
+            ctx.getSystemService(ActivityManager::class.java).getRunningTasks(8)
+                .firstOrNull { it.topActivity == top }
+        }.getOrNull()
+        val label = info?.taskDescription?.label.orEmpty()
+        if (info == null || label.isEmpty()) {
+            if (retry < RETRIES) bg.postDelayed({ front(top, retry + 1) }, RETRY_GAP)
+            else Xp.log(TAG + "no labelled task for ${top.shortClassName}")
+            return
+        }
+        val name = BRANDS.firstOrNull { label.contains(it, ignoreCase = true) }
+        if (name == null) {
+            Xp.d(TAG + "mini program not on the list: $label")
+            stop()
+            return
+        }
+        if (info.taskId == taskId) return
+        stop()
+        taskId = info.taskId
+        brand = label
+        reads = 0
+        val g = gen
+        Xp.log(TAG + "tracking task $taskId ($label)")
+        bg.postDelayed({ read(taskId, g) }, FIRST)
+    }
+
+    private fun stop() {
+        gen++
+        taskId = -1
+        bg.removeCallbacksAndMessages(null)
+    }
+
+    private fun read(task: Int, g: Int) {
+        if (g != gen || task != taskId) return
+        if (++reads > MAX_READS) return
+        // Not while the screen is off or locked: the page is not being looked at.
+        val ctx = Main.appContext() ?: return
+        val power = ctx.getSystemService(android.os.PowerManager::class.java)
+        val keyguard = ctx.getSystemService(android.app.KeyguardManager::class.java)
+        if (power?.isInteractive == false || keyguard?.isKeyguardLocked == true) {
+            next(task, g)
+            return
+        }
+        val t0 = SystemClock.uptimeMillis()
+        val timeout = Runnable { if (g == gen) { lastRead = "timeout"; next(task, g) } }
+        bg.postDelayed(timeout, TIMEOUT)
+        val asked = request(task) { st ->
+            bg.post {
+                bg.removeCallbacks(timeout)
+                if (g != gen) return@post
+                val nodes = if (st != null) runCatching { nodes(st) }.getOrNull() else null
+                val r = nodes?.let { PickupParse.parse(it) }
+                val ms = SystemClock.uptimeMillis() - t0
+                lastRead = when {
+                    st == null -> "no structure (${ms}ms)"
+                    nodes == null -> "unreadable (${ms}ms)"
+                    r == null -> "no code in ${nodes.size} texts (${ms}ms)"
+                    else -> "code found in ${nodes.size} texts (${ms}ms)"
+                }
+                if (r != null) {
+                    lastHead = ""
+                    Xp.d(TAG + "$brand: ${r.code} ${r.label} ${r.status} ${r.store}")
+                    show(r, task)
+                } else if (nodes != null) {
+                    val front = nodes.maxOfOrNull { it.page } ?: -1
+                    lastHead = "page $front: " + nodes.filter { it.page == front }.take(12)
+                        .joinToString("|") { it.text.take(12) }
+                }
+                next(task, g)
+            }
+        }
+        if (!asked) {
+            bg.removeCallbacks(timeout)
+            lastRead = "not asked"
+            next(task, g)
+        }
+    }
+
+    private fun next(task: Int, g: Int) {
+        if (g == gen && task == taskId) bg.postDelayed({ read(task, g) }, if (reads <= QUICK) QUICK_GAP else EVERY)
+    }
+
+    /**
+     * IActivityTaskManager.requestAssistDataForTask(receiver, taskId, callingPackage,
+     * attributionTag, fetchStructure) - Android 17's five; the appop it notes is checked against
+     * SystemUI's own package. The receiver is a bare Binder: IAssistDataReceiver's transaction 1
+     * is onHandleAssistData(Bundle), 2 the screenshot, both oneway.
+     */
+    private fun request(task: Int, done: (AssistStructure?) -> Unit): Boolean {
+        val receiver = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (code == 1) {
+                    val st = runCatching {
+                        data.enforceInterface("android.app.IAssistDataReceiver")
+                        val b = if (data.readInt() != 0) Bundle.CREATOR.createFromParcel(data) else null
+                        b?.classLoader = AssistStructure::class.java.classLoader
+                        @Suppress("DEPRECATION")
+                        b?.getParcelable<AssistStructure>("structure")
+                    }.getOrNull()
+                    done(st)
+                    return true
+                }
+                if (code == 2) return true
+                return super.onTransact(code, data, reply, flags)
+            }
+        }
+        receiver.attachInterface(null, "android.app.IAssistDataReceiver")
+        return runCatching {
+            val atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null)
+            val recv = Class.forName("android.app.IAssistDataReceiver")
+            val proxy = Class.forName("android.app.IAssistDataReceiver\$Stub")
+                .getMethod("asInterface", IBinder::class.java).invoke(null, receiver)
+            val m = atm.javaClass.methods.firstOrNull { it.name == "requestAssistDataForTask" }
+                ?: error("no requestAssistDataForTask")
+            val ok = when (m.parameterTypes.size) {
+                5 -> m.invoke(atm, proxy, task, SYSUI, null, true)
+                4 -> m.invoke(atm, proxy, task, SYSUI, null)
+                else -> error("requestAssistDataForTask${m.parameterTypes.toList()}")
+            }
+            ok as? Boolean ?: true
+        }.onFailure {
+            Xp.log(TAG + "assist request failed: $it")
+        }.getOrDefault(false)
+    }
+
+    /** The structure's texts in tree order, each with the WebView it is in. */
+    private fun nodes(st: AssistStructure): List<PickupParse.Node> {
+        val out = ArrayList<PickupParse.Node>()
+        var pages = -1
+        fun walk(n: AssistStructure.ViewNode, page: Int) {
+            var p = page
+            if (n.className?.endsWith("WebView") == true) p = ++pages
+            n.text?.let { if (it.isNotBlank()) out.add(PickupParse.Node(it.toString(), p)) }
+            for (i in 0 until n.childCount) walk(n.getChildAt(i), p)
+        }
+        for (i in 0 until st.windowNodeCount) walk(st.getWindowNodeAt(i).rootViewNode, -1)
+        return out
+    }
+
+    // ---------------------------------------------------------------- the island
+
+    private fun show(r: PickupParse.Result, task: Int) {
+        val key = "$brand|${r.code}|${r.status}|${r.store}"
+        val now = SystemClock.elapsedRealtime()
+        if (muted == "$brand|${r.code}" && now < mutedUntil) return
+        if (key == shownKey) return
+        val ctx = Main.appContext() ?: return
+        // A new code floats the island open; its state or shop changing only updates it.
+        val fresh = shownKey?.startsWith("$brand|${r.code}|") != true
+        runCatching { post(ctx, r, task, fresh) }
+            .onSuccess { shownKey = key; shownTask = task }
+            .onFailure { Xp.log(TAG + "not posted: $it") }
+    }
+
+    private fun takeDown(why: String) {
+        if (shownKey == null) return
+        shownKey = null
+        Main.appContext()?.getSystemService(NotificationManager::class.java)?.cancel(ID)
+        Xp.log(TAG + "taken down: $why")
+    }
+
+    private fun receivers(ctx: Context) {
+        if (receivers) return
+        receivers = true
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                when (i.action) {
+                    ACTION_OPEN -> bg.post { open(c) }
+                    ACTION_GONE -> bg.post {
+                        val k = shownKey ?: return@post
+                        muted = k.split('|').take(2).joinToString("|")
+                        mutedUntil = SystemClock.elapsedRealtime() + LIFE
+                        shownKey = null
+                        Xp.log(TAG + "swiped away")
+                    }
+                }
+            }
+        }
+        ctx.registerReceiver(r, IntentFilter().apply {
+            addAction(ACTION_OPEN)
+            addAction(ACTION_GONE)
+        }, Context.RECEIVER_NOT_EXPORTED)
+    }
+
+    /** The mini program's task back in front; 微信 if the task is gone. */
+    private fun open(c: Context) {
+        val am = c.getSystemService(ActivityManager::class.java)
+        val ok = shownTask >= 0 && runCatching {
+            @Suppress("DEPRECATION")
+            am.getRunningTasks(64).any { it.taskId == shownTask } || error("gone")
+            am.moveTaskToFront(shownTask, ActivityManager.MOVE_TASK_WITH_HOME)
+        }.isSuccess
+        if (!ok) {
+            runCatching {
+                c.packageManager.getLaunchIntentForPackage(WECHAT)
+                    ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)?.let { c.startActivity(it) }
+            }.onFailure { Xp.log(TAG + "微信 not opened: $it") }
+        }
+    }
+
+    @android.annotation.SuppressLint("NotificationPermission")
+    private fun post(c: Context, r: PickupParse.Result, task: Int, fresh: Boolean) {
+        receivers(c)
+        val nm = c.getSystemService(NotificationManager::class.java) ?: return
+        if (nm.getNotificationChannel(CHANNEL) == null) {
+            nm.createNotificationChannel(NotificationChannel(CHANNEL, "取餐码",
+                NotificationManager.IMPORTANCE_DEFAULT).apply {
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            })
+        }
+        val pic = icon(c, task)
+        val title = r.status ?: r.label
+        val content = listOfNotNull(brand, r.store).joinToString(" · ")
+        val island = JSONObject()
+            .put("islandProperty", 1)
+            .put("islandPriority", 2)
+            .put("bigIslandArea", JSONObject()
+                .put("imageTextInfoLeft", JSONObject()
+                    .put("type", 1)
+                    .put("picInfo", JSONObject().put("type", 1).put("pic", PIC))
+                    .put("textInfo", JSONObject().put("title", r.code)))
+                .put("imageTextInfoRight", JSONObject()
+                    .put("type", 2)
+                    .put("textInfo", JSONObject().put("title", title))))
+            .put("smallIslandArea", JSONObject()
+                .put("picInfo", JSONObject().put("type", 1).put("pic", PIC)))
+        val param = JSONObject()
+            .put("protocol", 1)
+            .put("business", "pickup_code")
+            .put("scene", "template_v2")
+            .put("ticker", "${r.label} ${r.code}")
+            .put("tickerPic", PIC)
+            .put("aodTitle", "${r.label} ${r.code}")
+            .put("aodPic", PIC)
+            .put("enableFloat", fresh)
+            .put("updatable", true)
+            .put("param_island", island)
+            .put("title", r.code)
+            .put("content", content)
+            .put("baseInfo", JSONObject()
+                .put("type", 2)
+                .put("title", r.code)
+                .put("content", content)
+                .put("subContent", title))
+            .put("picInfo", JSONObject().put("type", 1).put("pic", PIC))
+        val extras = Bundle()
+        extras.putString("miui.focus.param", JSONObject().put("param_v2", param).toString())
+        extras.putBundle("miui.focus.pics", Bundle().apply { putParcelable(PIC, Icon.createWithBitmap(pic)) })
+        val tap = PendingIntent.getBroadcast(c, ID, Intent(ACTION_OPEN).setPackage(SYSUI),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val gone = PendingIntent.getBroadcast(c, ID + 1, Intent(ACTION_GONE).setPackage(SYSUI),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val n = Notification.Builder(c, CHANNEL)
+            .setSmallIcon(Icon.createWithBitmap(pic))
+            .setContentTitle("${r.label} ${r.code}")
+            .setContentText(listOf(content, title).filter { it.isNotEmpty() }.joinToString(" · "))
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(!fresh)
+            .setShowWhen(false)
+            .setAutoCancel(false)
+            .setTimeoutAfter(LIFE)
+            .setDeleteIntent(gone)
+            .setContentIntent(tap)
+            .addExtras(extras)
+            .build()
+        nm.notify(ID, n)
+        Xp.log(TAG + (if (fresh) "up: " else "updated: ") + brand)
+    }
+
+    /**
+     * The mini program's own icon, which its task carries (TaskDescription: in memory, or the
+     * file the system keeps it in); 微信's when it has none.
+     */
+    private fun icon(c: Context, task: Int): Bitmap {
+        val fromTask = runCatching {
+            @Suppress("DEPRECATION")
+            val td = c.getSystemService(ActivityManager::class.java).getRunningTasks(64)
+                .firstOrNull { it.taskId == task }?.taskDescription ?: return@runCatching null
+            val cls = td.javaClass
+            (cls.getMethod("getInMemoryIcon").invoke(td) as? Bitmap) ?: run {
+                val file = cls.getMethod("getIconFilename").invoke(td) as? String ?: return@run null
+                cls.getMethod("loadTaskDescriptionIcon", String::class.java, Int::class.java)
+                    // UserHandle's hash is its user id.
+                    .invoke(null, file, android.os.Process.myUserHandle().hashCode()) as? Bitmap
+            }
+        }.onFailure {
+            if (!iconSaid) { iconSaid = true; Xp.log(TAG + "task icon: $it") }
+        }.getOrNull()
+        if (fromTask != null) return fromTask
+        if (!iconSaid) { iconSaid = true; Xp.log(TAG + "task icon: none, 微信's instead") }
+        val d = c.packageManager.getApplicationIcon(WECHAT)
+        val size = 144
+        return Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also {
+            d.setBounds(0, 0, size, size)
+            d.draw(Canvas(it))
+        }
+    }
+}

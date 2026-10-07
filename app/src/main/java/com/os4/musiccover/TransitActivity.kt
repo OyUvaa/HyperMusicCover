@@ -22,6 +22,7 @@ import com.os4.musiccover.ui.screen.features.TransitDemo
 import com.os4.musiccover.ui.theme.AppTheme
 import com.os4.musiccover.ui.util.PageScaffold
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 
@@ -98,6 +99,18 @@ private fun TransitPage(blur: Boolean, refreshKey: Int, onBack: () -> Unit) {
                     onCheckedChange = {
                         module = module.copy(transit = it)
                         ModuleBridge.setTransit(context, it)
+                    })
+            }
+        }
+        item {
+            SmallTitle(text = stringResource(R.string.pickup_title), modifier = Modifier.padding(top = 12.dp))
+            Card(Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
+                SwitchPreference(title = stringResource(R.string.pickup_enabled),
+                    summary = stringResource(R.string.pickup_summary),
+                    checked = module.alive && module.pickup, enabled = module.alive,
+                    onCheckedChange = {
+                        module = module.copy(pickup = it)
+                        ModuleBridge.setPickup(context, it)
                     })
             }
         }

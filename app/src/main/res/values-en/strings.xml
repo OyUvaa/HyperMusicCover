@@ -222,4 +222,7 @@
     <string name="demo_transit_island_title">The super island when unlocked</string>
     <string name="demo_transit_ride_title">Stop by stop</string>
     <string name="demo_transit_alert_title">Transfers and arrival</string>
+    <string name="pickup_title">Pickup code</string>
+    <string name="pickup_enabled">WeChat order pickup code on the island</string>
+    <string name="pickup_summary">When an ordering mini program\'s order page is open, its pickup code is shown on the island and the lock screen. Only listed brands are read, and nothing on the page is kept</string>
 </resources>

@@ -955,6 +955,8 @@ public class Main extends XposedModule {
         AmapFocus.install(cl);
         // A ride code opened or a card's fare taken, for the trip card's 到站 (RideCodeExit).
         RideCodeExit.INSTANCE.install(cl);
+        // A 微信 order page's pickup code, as an island (PickupCodeIsland).
+        PickupCodeIsland.INSTANCE.install(cl);
 
         try {
             sContainerCls = Xp.findClass(CLS_CONTAINER, cl);
@@ -1943,6 +1945,7 @@ public class Main extends XposedModule {
                     + "\nfpavoid=" + sFpAvoid
                     // On when absent: the trip's page and island shipped before their switch.
                     + "\ntransit=" + (AmapTransitScene.sOn ? 1 : 0)
+                    + "\npickup=" + (PickupCodeIsland.sOn ? 1 : 0)
                     + "\nminicfg=" + android.util.Base64.encodeToString(
                             MiniPlayerRuntime.configJson(sAppCtx).getBytes(java.nio.charset.StandardCharsets.UTF_8),
                             android.util.Base64.NO_WRAP)
@@ -2052,6 +2055,7 @@ public class Main extends XposedModule {
                         }
                         else if ("fpavoid".equals(k)) sFpAvoid = Integer.parseInt(v);
                         else if ("transit".equals(k)) AmapTransitScene.sOn = "1".equals(v);
+                        else if ("pickup".equals(k)) PickupCodeIsland.sOn = "1".equals(v);
                         else if ("minicfg".equals(k)) MiniPlayerRuntime.applyConfig(sAppCtx,
                                 new String(android.util.Base64.decode(v, android.util.Base64.DEFAULT),
                                         java.nio.charset.StandardCharsets.UTF_8));
@@ -2765,6 +2769,15 @@ public class Main extends XposedModule {
                     } else if ("minicfg".equals(op)) {
                         MiniPlayerRuntime.applyConfig(c, i.getStringExtra("json"));
                         saveState();
+                    } else if ("pickup".equals(op)) {
+                        // 取餐码: --ez on true|false from the app; --es do read for one read
+                        // now; the state as the result either way.
+                        if (i.hasExtra("on")) {
+                            PickupCodeIsland.INSTANCE.setOn(i.getBooleanExtra("on", true));
+                            saveState();
+                        }
+                        if ("read".equals(i.getStringExtra("do"))) PickupCodeIsland.INSTANCE.readNow();
+                        setResultData(PickupCodeIsland.INSTANCE.describe());
                     } else if ("transitcfg".equals(op)) {
                         // 「高德公交地铁」: --ez on true|false from the app; without it, 高德
                         // asking as it starts (AmapImmerse), and told what it is.
@@ -2843,6 +2856,7 @@ public class Main extends XposedModule {
                                 || LyricSource.hasLyricInfo(sWatched));
                         out.putInt("fpavoid", sFpAvoid);
                         out.putBoolean("transit", AmapTransitScene.sOn);
+                        out.putBoolean("pickup", PickupCodeIsland.sOn);
                         // Everything the app's preview needs to be to scale. It draws a lock
                         // screen it cannot see, and every one of these is device-specific, so
                         // they are measured here rather than written down twice.
