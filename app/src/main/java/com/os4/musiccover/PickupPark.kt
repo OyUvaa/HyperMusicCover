@@ -49,11 +49,12 @@ internal object PickupPark {
 
     private val bg: Handler by lazy { Handler(HandlerThread("mc-pickup-park").apply { start() }.looper) }
 
-    // All below on [bg], but for [parked], which anyone may read.
+    // All below on [bg], but for [parked] and [since], which anyone may read.
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
     @Volatile private var parked = -1
-    private var since = 0L
+    /** When the current park began, for whoever decides it has lasted long enough. */
+    @Volatile private var since = 0L
     private var until = 0L
     private var every = EVERY
     private var reads = 0
@@ -126,13 +127,46 @@ internal object PickupPark {
         return out
     }
 
-    /** [release] from any thread: the display's own thread does the work. */
-    fun releaseFrom(why: String) {
-        if (parked < 0 && vd == null) return
-        bg.post { release(why) }
+    /** [release] from any thread: the display's own thread does the work, [then] after it. */
+    fun releaseFrom(why: String, then: (() -> Unit)? = null) {
+        if (parked < 0 && vd == null) {
+            then?.invoke()
+            return
+        }
+        bg.post {
+            release(why)
+            then?.invoke()
+        }
+    }
+
+    /** [park] from any thread, once the order on screen is one worth waiting on. */
+    fun parkFrom(task: Int) {
+        if (task < 0 || parked == task) return
+        bg.post { park(task) }
+    }
+
+    /**
+     * [task] onto the hidden display and left there: the reads are the island's own loop (it reads
+     * the page wherever the task is), and [release] - or the display going away with this process -
+     * is what ends it. Returns what happened, for the probe's reply.
+     */
+    private fun park(task: Int): String {
+        if (parked >= 0) return "already parked: $parked"
+        val made = ensure()
+        if (made.startsWith("no display")) return made
+        val id = vd?.display?.displayId ?: return "no display"
+        val moved = move(task, id)
+        if (moved.startsWith("move failed")) return "$made, $moved"
+        parked = task
+        since = SystemClock.uptimeMillis()
+        Xp.log(TAG + "parked task $task on $id")
+        return "$made, $moved"
     }
 
     fun parked(): Int = parked
+
+    /** When the current park began, 0 while nothing is parked. */
+    fun sinceMs(): Long = since
 
     fun state(): String = "parked=$parked vd=${vd?.display?.displayId ?: -1}" + if (parked >= 0) {
         " reads=$reads at=${(SystemClock.uptimeMillis() - since) / 1000}s" +
@@ -154,21 +188,17 @@ internal object PickupPark {
      * task survives the round trip, page and all, as the shell probe measured.
      */
     fun experiment(task: Int, minutes: Int, everyMs: Long = 0): String {
-        if (parked >= 0) return "already parked: $parked"
-        val made = ensure()
-        if (made.startsWith("no display")) return made
-        val id = vd?.display?.displayId ?: return "no display"
-        val moved = move(task, id)
-        if (moved.startsWith("move failed")) return "$made, $moved"
-        parked = task
-        since = SystemClock.uptimeMillis()
-        until = since + minutes * 60_000L
+        val made = park(task)
+        if (made.startsWith("no display") || made.startsWith("move failed") || made.startsWith("already")) {
+            return made
+        }
+        until = SystemClock.uptimeMillis() + minutes * 60_000L
         every = if (everyMs > 0) everyMs else EVERY
         reads = 0
         seen.clear()
-        Xp.log(TAG + "parking $task on $id: a read every ${every / 1000}s for $minutes min")
+        Xp.log(TAG + "reading task $task every ${every / 1000}s for $minutes min")
         bg.post { read(task) }
-        return "$made, $moved, ${minutes} min"
+        return "$made, ${minutes} min"
     }
 
     private fun read(task: Int) {

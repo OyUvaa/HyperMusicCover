@@ -69,6 +69,15 @@ internal object PickupCodeIsland {
     private const val SLOW = 30_000L
     /** How long a task is read on after 微信 leaves the front before it is let go. */
     private const val LEFT = 2 * 60_000L
+    /** How often a parked page is read: OPPO's own three intervals, by what the order is doing. */
+    private const val PARK_FIRST = 2 * 60_000L
+    private const val PARK_MAKING = 60_000L
+    private const val PARK_READY = 3 * 60_000L
+    /** A parked task is let go after this, as ColorOS's observeagent does. */
+    private const val PARK_MAX = 30 * 60_000L
+    /** Battery, in percent: below the first the reads slow down, below the second the park ends. */
+    private const val LOW = 20
+    private const val EMPTY = 10
     /** Reads of one stay in front, at most: an hour at [EVERY]. */
     private const val MAX_READS = 720
     private const val LIFE = 30 * 60_000L
@@ -82,6 +91,9 @@ internal object PickupCodeIsland {
     private val READY = setOf(
         "待取餐", "请取餐", "可取餐", "已出餐", "已准备完毕", "制作完成", "已完成",
     )
+
+    /** The order is over: nothing left to wait on, and a parked task is let go. */
+    private val DONE = setOf("已完成", "已取消", "已退款")
 
     /** The mini programs read, matched in the task label. */
     private val BRANDS = listOf(
@@ -252,24 +264,80 @@ internal object PickupCodeIsland {
         inFront = false
         Xp.log(TAG + "left the mini program: top=" + (top?.flattenToShortString() ?: "none") +
             ", reading task $taskId on")
-        bg.postDelayed({ if (!inFront && taskId >= 0) stop() }, LEFT)
+        // Out of 微信 altogether: the order is worth waiting on, so the task goes onto the hidden
+        // display where the mini program keeps its own page current (PickupPark, §6). Not while 微信
+        // itself is in front: a mini program started from its own list would come back on a display
+        // nobody can see, and 微信 coming to the front releases it for the same reason.
+        if (top?.packageName != WECHAT && waiting()) {
+            PickupPark.parkFrom(taskId)
+            return
+        }
+        bg.postDelayed({ if (!inFront && taskId >= 0 && PickupPark.parked() != taskId) stop() }, LEFT)
+    }
+
+    /**
+     * Whether the order being shown is one whose state is still worth waiting for - a code is up and
+     * the order is not over. A park is what the wait costs, so it is not made for nothing.
+     */
+    private fun waiting(): Boolean =
+        shownKey != null && shownStatus?.let { s -> DONE.none { s.contains(it) } } != false
+
+    private fun battery(ctx: Context): Int =
+        ctx.getSystemService(android.os.BatteryManager::class.java)
+            ?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+
+    /**
+     * The rest of §6.3's list: a battery below [LOW] percent, a battery saver on, a phone running
+     * hot. ColorOS also skips while a game is being played or the camera is open; neither is
+     * something this process can see for nothing, so neither is here.
+     */
+    private fun tired(ctx: Context): Boolean {
+        val pm = ctx.getSystemService(android.os.PowerManager::class.java) ?: return false
+        return battery(ctx) in 1 until LOW || pm.isPowerSaveMode ||
+            pm.currentThermalStatus >= android.os.PowerManager.THERMAL_STATUS_MODERATE
     }
 
     private fun stop() {
         gen++
         taskId = -1
         inFront = false
+        PickupPark.releaseFrom("the tracked task was let go")
         bg.removeCallbacksAndMessages(null)
     }
 
     private fun read(task: Int, g: Int) {
         if (g != gen || task != taskId) return
         if (++reads > MAX_READS) return
-        // Not while the screen is off or locked: the page is not being looked at.
         val ctx = Main.appContext() ?: return
+        val parked = PickupPark.parked() == task
+        if (parked) {
+            // §6.3's gates, in the order the doc has them: below 10% the wait is over, and a low
+            // battery, a battery saver or a phone running hot skip a read. The park's own clock is
+            // asked, not one kept here: the probe parks tasks too, and one of those would look like
+            // a park that had already lasted [PARK_MAX].
+            val level = battery(ctx)
+            val since = PickupPark.sinceMs()
+            when {
+                since > 0 && SystemClock.uptimeMillis() - since > PARK_MAX -> {
+                    Xp.log(TAG + "parked for ${PARK_MAX / 60_000} min")
+                    PickupPark.releaseFrom("parked long enough")
+                }
+                level in 0..EMPTY -> {
+                    Xp.log(TAG + "battery $level%: the wait is over")
+                    PickupPark.releaseFrom("battery $level%")
+                }
+                tired(ctx) -> {
+                    next(task, g)
+                    return
+                }
+            }
+        }
+        // Not while the screen is off or locked: the page is not being looked at. A parked one is -
+        // the state wanted on the lock screen is exactly the parked page's, and it is kept current
+        // there - so it is read on, at the park's own intervals.
         val power = ctx.getSystemService(android.os.PowerManager::class.java)
         val keyguard = ctx.getSystemService(android.app.KeyguardManager::class.java)
-        if (power?.isInteractive == false || keyguard?.isKeyguardLocked == true) {
+        if (!parked && (power?.isInteractive == false || keyguard?.isKeyguardLocked == true)) {
             next(task, g)
             return
         }
@@ -293,6 +361,10 @@ internal object PickupCodeIsland {
                     lastHead = ""
                     Xp.d(TAG + "$brand: ${r.code} ${r.label} ${r.status} ${r.store}")
                     show(r, task)
+                    // §6.6: an order that is over ends the wait, and the parked task comes back.
+                    if (r.status != null && DONE.any { r.status.contains(it) }) {
+                        PickupPark.releaseFrom("the order is over (${r.status})")
+                    }
                 } else if (nodes != null) {
                     val front = nodes.maxOfOrNull { it.page } ?: -1
                     lastHead = "page $front: " + nodes.filter { it.page == front }.take(12)
@@ -311,11 +383,18 @@ internal object PickupCodeIsland {
     private fun next(task: Int, g: Int) {
         if (g != gen || task != taskId) return
         val gap = when {
+            PickupPark.parked() == task -> parkedGap()
             reads <= QUICK -> QUICK_GAP
             inFront -> EVERY
             else -> SLOW
         }
         bg.postDelayed({ read(task, g) }, gap)
+    }
+
+    /** OPPO's intervals for an order being waited on: what it is doing decides how often to look. */
+    private fun parkedGap(): Long {
+        val s = shownStatus ?: return PARK_FIRST
+        return if (READY.any { s.contains(it) }) PARK_READY else PARK_MAKING
     }
 
     /**
@@ -439,6 +518,7 @@ internal object PickupCodeIsland {
                         muted = k.split('|').take(2).joinToString("|")
                         mutedUntil = SystemClock.elapsedRealtime() + LIFE
                         clear()
+                        PickupPark.releaseFrom("swiped away")
                         Xp.log(TAG + "swiped away")
                     }
                 }
@@ -460,6 +540,16 @@ internal object PickupCodeIsland {
      * altogether (2026-10-08, the top the module saw right after a tap was com.miui.home/.launcher).
      */
     private fun open(c: Context) {
+        if (PickupPark.parked() >= 0) {
+            // §6.5: the task goes back to the display the user can see before it is brought to the
+            // front - moved to the front while parked, it would come up on the hidden one.
+            PickupPark.releaseFrom("the island was tapped") { openNow(c) }
+        } else {
+            openNow(c)
+        }
+    }
+
+    private fun openNow(c: Context) {
         val am = c.getSystemService(ActivityManager::class.java)
         @Suppress("DEPRECATION")
         val tasks = runCatching { am.getRunningTasks(64) }.getOrDefault(emptyList())
