@@ -39,6 +39,10 @@ import org.json.JSONObject
  * order list and the order are pages of one task and moving between them changes nothing
  * SystemUI hears. A code found is shown whatever the order's state; the island goes [LIFE] after
  * the code was last seen, or when swiped away (that code is then not shown again for [LIFE]).
+ *
+ * A new code floats the island open, and so does the order turning ready to collect ([READY]);
+ * anything else about a code already up only updates it. The island's being up is asked of the
+ * system rather than remembered, since the notification's own timeout takes it away unannounced.
  */
 internal object PickupCodeIsland {
 
@@ -66,6 +70,15 @@ internal object PickupCodeIsland {
     private const val LIFE = 30 * 60_000L
     private const val TIMEOUT = 3_000L
 
+    /**
+     * The order states worth floating the island open for - the food can be collected. [PickupParse]
+     * keeps the order's wording in its own list; this is what is done with a state, not reading it.
+     * 已完成 is in: some pages call the ready state that (蜜雪冰城's read 「订单已完成」).
+     */
+    private val READY = setOf(
+        "待取餐", "请取餐", "可取餐", "已出餐", "已准备完毕", "制作完成", "已完成",
+    )
+
     /** The mini programs read, matched in the task label. */
     private val BRANDS = listOf(
         // ColorOS's own (Gleaner, assets/observeAgent/applet-wechat-observe-config.json, v5) ...
@@ -89,6 +102,8 @@ internal object PickupCodeIsland {
     private var reads = 0
     private var gen = 0
     private var shownKey: String? = null
+    /** The state [shownKey] was posted with, to tell 制作中 → 待取餐 from a re-read of the same. */
+    private var shownStatus: String? = null
     private var shownTask = -1
     private var muted: String? = null
     private var mutedUntil = 0L
@@ -119,6 +134,7 @@ internal object PickupCodeIsland {
     }
 
     fun describe(): String = "on=$sOn task=$taskId brand=$brand reads=$reads shown=${shownKey != null}" +
+        " up=${Main.appContext()?.let { up(it) }}" +
         " last=$lastRead" + if (lastHead.isEmpty()) "" else " head=[$lastHead]"
 
     /** The probe's `do=read`: one read now, of whatever is tracked. */
@@ -287,18 +303,44 @@ internal object PickupCodeIsland {
         val key = "$brand|${r.code}|${r.status}|${r.store}"
         val now = SystemClock.elapsedRealtime()
         if (muted == "$brand|${r.code}" && now < mutedUntil) return
-        if (key == shownKey) return
         val ctx = Main.appContext() ?: return
-        // A new code floats the island open; its state or shop changing only updates it.
-        val fresh = shownKey?.startsWith("$brand|${r.code}|") != true
+        // The notification goes by itself [LIFE] after it was posted, and the island with it; nothing
+        // on that path tells us (a timeout is not a dismissal, so no delete intent, and [takeDown] is
+        // only for the switch). So ask the system: with the island gone, shownKey is not evidence of
+        // anything, and what comes next is a fresh code as far as the island is concerned.
+        if (shownKey != null && up(ctx) == false) clear()
+        if (key == shownKey) return
+        // A new code floats the island open; so does the order turning ready to collect. A state
+        // changing again while it is already ready only updates, and so does the shop.
+        val sameCode = shownKey?.startsWith("$brand|${r.code}|") == true
+        val fresh = !sameCode || ready(r.status) && !ready(shownStatus)
         runCatching { post(ctx, r, task, fresh) }
-            .onSuccess { shownKey = key; shownTask = task }
+            .onSuccess { shownKey = key; shownStatus = r.status; shownTask = task }
             .onFailure { Xp.log(TAG + "not posted: $it") }
     }
 
+    private fun ready(status: String?): Boolean = status != null && READY.any { status.contains(it) }
+
+    /** Nothing is up: forget what the island was showing. */
+    private fun clear() {
+        shownKey = null
+        shownStatus = null
+    }
+
+    /**
+     * Whether our own notification is still posted, the island going when it goes. Only this
+     * process's notifications are listed, and only this one is ours ([ID], [CHANNEL]). null is the
+     * system not saying - not an answer, so the caller keeps what it had; reading a failure as
+     * "gone" would float the island open again on every read.
+     */
+    private fun up(c: Context): Boolean? = runCatching {
+        c.getSystemService(NotificationManager::class.java)?.activeNotifications
+            ?.any { it.id == ID && it.notification.channelId == CHANNEL }
+    }.getOrNull()
+
     private fun takeDown(why: String) {
         if (shownKey == null) return
-        shownKey = null
+        clear()
         Main.appContext()?.getSystemService(NotificationManager::class.java)?.cancel(ID)
         Xp.log(TAG + "taken down: $why")
     }
@@ -314,7 +356,7 @@ internal object PickupCodeIsland {
                         val k = shownKey ?: return@post
                         muted = k.split('|').take(2).joinToString("|")
                         mutedUntil = SystemClock.elapsedRealtime() + LIFE
-                        shownKey = null
+                        clear()
                         Xp.log(TAG + "swiped away")
                     }
                 }
@@ -382,6 +424,12 @@ internal object PickupCodeIsland {
             .put("aodTitle", "${r.label} ${r.code}")
             .put("aodPic", PIC)
             .put("enableFloat", fresh)
+            // The island's own float, a second gate: FocusNotifPreHandler writes it as
+            // miui.island.firstFloat from this key and defaults it to false when the key is missing,
+            // and FocusNotificationController floats only when it is true. Left out, an update never
+            // brings the island up - a new code in the same notification (id 1241 is one key) showed
+            // in the shade alone. 地铁乘车码's card sets the same key the same way.
+            .put("islandFirstFloat", fresh)
             .put("updatable", true)
             .put("param_island", island)
             .put("title", r.code)
