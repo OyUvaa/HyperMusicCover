@@ -65,6 +65,10 @@ internal object PickupCodeIsland {
     private const val RETRIES = 10
     private const val RETRY_GAP = 300L
     private const val EVERY = 5_000L
+    /** How often the page is read while the mini program is not the front activity. */
+    private const val SLOW = 30_000L
+    /** How long a task is read on after 微信 leaves the front before it is let go. */
+    private const val LEFT = 2 * 60_000L
     /** Reads of one stay in front, at most: an hour at [EVERY]. */
     private const val MAX_READS = 720
     private const val LIFE = 30 * 60_000L
@@ -98,12 +102,16 @@ internal object PickupCodeIsland {
     // All below on [bg].
     private var lastTop: ComponentName? = null
     private var taskId = -1
+    /** Whether the tracked mini program is the front activity, which sets how often it is read. */
+    private var inFront = false
     private var brand = ""
     private var reads = 0
     private var gen = 0
     private var shownKey: String? = null
     /** The state [shownKey] was posted with, to tell 制作中 → 待取餐 from a re-read of the same. */
     private var shownStatus: String? = null
+    /** The notification tag [shownKey] was posted under, null for the untagged one. */
+    private var shownTag: String? = null
     private var shownTask = -1
     private var muted: String? = null
     private var mutedUntil = 0L
@@ -130,7 +138,41 @@ internal object PickupCodeIsland {
 
     fun setOn(on: Boolean) {
         sOn = on
-        bg.post { if (!on) { stop(); takeDown("switched off") } }
+        bg.post {
+            if (!on) {
+                stop()
+                takeDown("switched off")
+                PickupPark.releaseFrom("switched off")
+            }
+        }
+    }
+
+    /** The task the front mini program is being read from, -1 for none (the probe's `do vdtest`). */
+    fun trackedTask(): Int = taskId
+
+    /**
+     * One read of an arbitrary task, for the park experiment (the probe's `do vdtest`): the assist
+     * request a tracked read makes, handed back parsed and counted rather than shown. [done] runs on
+     * [bg]; the island's own state is not touched.
+     */
+    fun readOnce(task: Int, done: (PickupParse.Result?, Int) -> Unit) {
+        // Answered once: the assist reply, or [TIMEOUT]. A request that is never answered would
+        // otherwise park the caller's loop for good.
+        val said = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun once(r: PickupParse.Result?, n: Int) {
+            if (said.compareAndSet(false, true)) bg.post { done(r, n) }
+        }
+        val timeout = Runnable { once(null, 0) }
+        bg.postDelayed(timeout, TIMEOUT)
+        val asked = request(task) { st ->
+            bg.removeCallbacks(timeout)
+            val nodes = if (st != null) runCatching { nodes(st) }.getOrNull() else null
+            once(nodes?.let { PickupParse.parse(it) }, nodes?.size ?: 0)
+        }
+        if (!asked) {
+            bg.removeCallbacks(timeout)
+            once(null, 0)
+        }
     }
 
     fun describe(): String = "on=$sOn task=$taskId brand=$brand reads=$reads shown=${shownKey != null}" +
@@ -153,7 +195,10 @@ internal object PickupCodeIsland {
             return
         }
         if (!sOn || top == null || top.packageName != WECHAT || !top.className.startsWith(MINI)) {
-            stop()
+            // A parked task must not stay on the hidden display once 微信 is in front again: the mini
+            // program tapped from its own list would come back on a display nobody can see.
+            if (top?.packageName == WECHAT) PickupPark.releaseFrom("微信 is in front again")
+            left(top)
             return
         }
         val ctx = Main.appContext() ?: return
@@ -174,19 +219,46 @@ internal object PickupCodeIsland {
             stop()
             return
         }
-        if (info.taskId == taskId) return
+        if (info.taskId == taskId) {
+            inFront = true
+            return
+        }
         stop()
         taskId = info.taskId
         brand = label
         reads = 0
+        inFront = true
         val g = gen
         Xp.log(TAG + "tracking task $taskId ($label)")
         bg.postDelayed({ read(taskId, g) }, FIRST)
     }
 
+    /**
+     * The front activity is not the mini program, or not any more. Being in front is how a task is
+     * found, not what it is read for: 微信's own pages, and whatever comes over the mini program while
+     * the user is still in it, arrive as a top that is not it - and with the top settling back on the
+     * mini program no further event comes, so a read loop killed here never came back. A second order
+     * in the same mini program stopped updating the island that way (2026-10-08: the task was dropped
+     * and its reads froze at 7 while the user sat in the mini program). So the task is kept and read
+     * on, slower; only [LEFT] spent without being in front ends it - 微信's own pages are worth being
+     * read over, the phone in a pocket is not.
+     */
+    private fun left(top: ComponentName?) {
+        if (taskId < 0) {
+            stop()
+            return
+        }
+        if (!inFront) return
+        inFront = false
+        Xp.log(TAG + "left the mini program: top=" + (top?.flattenToShortString() ?: "none") +
+            ", reading task $taskId on")
+        bg.postDelayed({ if (!inFront && taskId >= 0) stop() }, LEFT)
+    }
+
     private fun stop() {
         gen++
         taskId = -1
+        inFront = false
         bg.removeCallbacksAndMessages(null)
     }
 
@@ -237,7 +309,13 @@ internal object PickupCodeIsland {
     }
 
     private fun next(task: Int, g: Int) {
-        if (g == gen && task == taskId) bg.postDelayed({ read(task, g) }, if (reads <= QUICK) QUICK_GAP else EVERY)
+        if (g != gen || task != taskId) return
+        val gap = when {
+            reads <= QUICK -> QUICK_GAP
+            inFront -> EVERY
+            else -> SLOW
+        }
+        bg.postDelayed({ read(task, g) }, gap)
     }
 
     /**
@@ -325,6 +403,7 @@ internal object PickupCodeIsland {
     private fun clear() {
         shownKey = null
         shownStatus = null
+        shownTag = null
     }
 
     /**
@@ -340,8 +419,11 @@ internal object PickupCodeIsland {
 
     private fun takeDown(why: String) {
         if (shownKey == null) return
+        val tag = shownTag
         clear()
-        Main.appContext()?.getSystemService(NotificationManager::class.java)?.cancel(ID)
+        Main.appContext()?.getSystemService(NotificationManager::class.java)?.let {
+            if (tag == null) it.cancel(ID) else it.cancel(tag, ID)
+        }
         Xp.log(TAG + "taken down: $why")
     }
 
@@ -368,13 +450,23 @@ internal object PickupCodeIsland {
         }, Context.RECEIVER_NOT_EXPORTED)
     }
 
-    /** The mini program's task back in front; 微信 if the task is gone. */
+    /**
+     * The mini program's task back in front, over 微信's own task so that Back from it lands in 微信,
+     * and 微信 itself if the task is gone.
+     *
+     * 微信's task is moved forward first, and the mini program's without [MOVE_TASK_WITH_HOME]: that
+     * flag brings the task's home along, and the home of an appbrand task is the launcher - tapping
+     * the island opened the mini program over the desktop, so Back took the user out of 微信
+     * altogether (2026-10-08, the top the module saw right after a tap was com.miui.home/.launcher).
+     */
     private fun open(c: Context) {
         val am = c.getSystemService(ActivityManager::class.java)
-        val ok = shownTask >= 0 && runCatching {
-            @Suppress("DEPRECATION")
-            am.getRunningTasks(64).any { it.taskId == shownTask } || error("gone")
-            am.moveTaskToFront(shownTask, ActivityManager.MOVE_TASK_WITH_HOME)
+        @Suppress("DEPRECATION")
+        val tasks = runCatching { am.getRunningTasks(64) }.getOrDefault(emptyList())
+        val ok = shownTask >= 0 && tasks.any { it.taskId == shownTask } && runCatching {
+            tasks.firstOrNull { it.taskId != shownTask && it.baseActivity?.packageName == WECHAT }
+                ?.let { am.moveTaskToFront(it.taskId, 0) }
+            am.moveTaskToFront(shownTask, 0)
         }.isSuccess
         if (!ok) {
             runCatching {
@@ -461,8 +553,22 @@ internal object PickupCodeIsland {
             .setContentIntent(tap)
             .addExtras(extras)
             .build()
-        nm.notify(ID, n)
-        Xp.log(TAG + (if (fresh) "up: " else "updated: ") + brand)
+        // A post that must float the island gets a notification key of its own. MIUI keeps per-key
+        // state for a focus notification (FocusNotificationController's hasEverExpandedKeys and its
+        // island-data map), and with one fixed key - 1241, no tag, the same for every order - the
+        // island came up for a key once and never again after it had gone: a second code, or one
+        // re-read after the user tapped the island away, was left in the shade alone while the
+        // module kept posting. A tag makes that a new key, and the one left behind is dropped first
+        // (two focus notifications at once would be two islands). A quiet update keeps the key it
+        // was posted under, so it stays one island being updated.
+        val tag = if (fresh) "mc-" + SystemClock.elapsedRealtime() else shownTag
+        runCatching {
+            if (tag != shownTag) {
+                if (shownTag == null) nm.cancel(ID) else nm.cancel(shownTag, ID)
+            }
+            nm.notify(tag, ID, n)
+        }.onSuccess { shownTag = tag }
+        Xp.log(TAG + (if (fresh) "up: " else "updated: ") + brand + " (tag=${tag ?: "-"})")
     }
 
     /**
