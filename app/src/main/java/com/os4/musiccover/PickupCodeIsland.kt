@@ -75,6 +75,8 @@ internal object PickupCodeIsland {
     private const val PARK_READY = 3 * 60_000L
     /** A parked task is let go after this, as ColorOS's observeagent does. */
     private const val PARK_MAX = 30 * 60_000L
+    /** How long a task stays unparked after the island was tapped. */
+    private const val NO_PARK = 5 * 60_000L
     /** Battery, in percent: below the first the reads slow down, below the second the park ends. */
     private const val LOW = 20
     private const val EMPTY = 10
@@ -116,6 +118,8 @@ internal object PickupCodeIsland {
     private var taskId = -1
     /** Whether the tracked mini program is the front activity, which sets how often it is read. */
     private var inFront = false
+    /** Until when the task is not parked again, set when the island is tapped (see [left]). */
+    private var noParkUntil = 0L
     private var brand = ""
     private var reads = 0
     private var gen = 0
@@ -267,8 +271,11 @@ internal object PickupCodeIsland {
         // Out of 微信 altogether: the order is worth waiting on, so the task goes onto the hidden
         // display where the mini program keeps its own page current (PickupPark, §6). Not while 微信
         // itself is in front: a mini program started from its own list would come back on a display
-        // nobody can see, and 微信 coming to the front releases it for the same reason.
-        if (top?.packageName != WECHAT && waiting()) {
+        // nobody can see, and 微信 coming to the front releases it for the same reason. Not right
+        // after the island was tapped either: the user is in the mini program, and the front flickers
+        // through the launcher as they move about it - parking on that flicker took the mini program
+        // away from them mid-use (2026-10-08).
+        if (top?.packageName != WECHAT && waiting() && SystemClock.uptimeMillis() >= noParkUntil) {
             PickupPark.parkFrom(taskId)
             return
         }
@@ -280,7 +287,11 @@ internal object PickupCodeIsland {
      * the order is not over. A park is what the wait costs, so it is not made for nothing.
      */
     private fun waiting(): Boolean =
-        shownKey != null && shownStatus?.let { s -> DONE.none { s.contains(it) } } != false
+        shownKey != null && !over(shownStatus)
+
+    /** Whether an order that reads [s] has nothing left to wait for: ready, or over. */
+    private fun over(s: String?): Boolean =
+        s != null && (READY.any { s.contains(it) } || DONE.any { s.contains(it) })
 
     private fun battery(ctx: Context): Int =
         ctx.getSystemService(android.os.BatteryManager::class.java)
@@ -361,10 +372,10 @@ internal object PickupCodeIsland {
                     lastHead = ""
                     Xp.d(TAG + "$brand: ${r.code} ${r.label} ${r.status} ${r.store}")
                     show(r, task)
-                    // §6.6: an order that is over ends the wait, and the parked task comes back.
-                    if (r.status != null && DONE.any { r.status.contains(it) }) {
-                        PickupPark.releaseFrom("the order is over (${r.status})")
-                    }
+                    // §6.6, and one state further: an order that is ready to collect is nothing to
+                    // wait for any more, so the park ends there and not only at 已完成 - the wait is
+                    // for the change, and the user is on their way to the counter.
+                    if (over(r.status)) PickupPark.releaseFrom("the order reads ${r.status}")
                 } else if (nodes != null) {
                     val front = nodes.maxOfOrNull { it.page } ?: -1
                     lastHead = "page $front: " + nodes.filter { it.page == front }.take(12)
@@ -540,6 +551,10 @@ internal object PickupCodeIsland {
      * altogether (2026-10-08, the top the module saw right after a tap was com.miui.home/.launcher).
      */
     private fun open(c: Context) {
+        // Tapping the island is the user going into the mini program: nothing is parked again for
+        // [NO_PARK] while they are in there. See [left] - the front flickers through the launcher as
+        // they move about it, and parking on that flicker takes it away from them mid-use.
+        noParkUntil = SystemClock.uptimeMillis() + NO_PARK
         if (PickupPark.parked() >= 0) {
             // §6.5: the task goes back to the display the user can see before it is brought to the
             // front - moved to the front while parked, it would come up on the hidden one.
