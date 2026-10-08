@@ -5232,14 +5232,24 @@ public class Main extends XposedModule {
     }
 
     /**
-     * allowCard gates the media card thumbnail. It is the only source when the player publishes
-     * nothing but an artwork URI, but it lags a track change by a moment - long enough to hand
-     * back the PREVIOUS album - so callers that can afford to wait ask for the session only.
+     * Three sources, most preferred first: the session's own bitmap, the artwork URI it published
+     * (read by ArtUri), and the media card thumbnail.
      *
-     * sessionBits, when passed, is filled in with what the session turned out to be: 1 it
-     * carried a bitmap, 0 it carried none, -1 there was no session to ask. The caller needs the
-     * difference between the last two, because one is a player still filling its bitmap in and
-     * the other is a player that never publishes one - and this is the only place that sees it.
+     * allowCard gates the card. It lags a track change by a moment - long enough to hand back the
+     * PREVIOUS album, or the card's own empty art - so callers that can afford to wait ask for the
+     * session only, and the URI is given its window before the card is let in at all.
+     *
+     * The URI is read only on the push path (sessionBits != null), and only when the session
+     * carried no bitmap of its own. That is the narrow case it exists for: a player that
+     * publishes art as a URL and nothing else - MeiloX, and Bilibili for most of its switches -
+     * had no source here at all, and the card underneath it answered with a black stub often
+     * enough to be the visible bug. A player that does hand over a bitmap is never touched.
+     *
+     * sessionBits, when passed, is filled in with what the session turned out to be: 1 it carried
+     * a bitmap (its own, or the one behind its URI), 0 it carried none but published artwork that
+     * is being read right now, -1 there was no session to ask, -2 it carried no bitmap and no
+     * artwork URI either. The caller needs the last two apart from the rest: 0 is a player still
+     * coming, -2 is one that never will, and this is the only place that sees the difference.
      */
     static Bitmap albumArt(Context ctx, boolean allowCard, int[] sessionBits) {
         if (sessionBits != null) sessionBits[0] = -1;
@@ -5259,13 +5269,45 @@ public class Main extends XposedModule {
                             + md.getString(MediaMetadata.METADATA_KEY_TITLE) + "\"");
                     return b;
                 }
-                if (sessionBits != null) sessionBits[0] = 0;
-                Xp.log(TAG + c.getPackageName() + " carries no art bitmap (uri="
-                        + md.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI) + ")");
+                String uri = artworkUri(md);
+                if (sessionBits != null && uri != null) {
+                    Bitmap got = ArtUri.peek(uri);
+                    if (got != null) {
+                        sessionBits[0] = 1;
+                        Xp.log(TAG + "album art from " + c.getPackageName()
+                                + "'s own artwork URI " + got.getWidth() + "x" + got.getHeight()
+                                + " \"" + md.getString(MediaMetadata.METADATA_KEY_TITLE) + "\"");
+                        return got;
+                    }
+                    ArtUri.warm(uri);
+                    // Held back only while the read is young and the card is not yet allowed -
+                    // which is every try but the last one, and the last one would otherwise push
+                    // nothing at all. Past the window, or once the read has failed, this falls
+                    // through to the card exactly as it did before.
+                    if (ArtUri.waiting(uri) && !allowCard) {
+                        sessionBits[0] = 0;
+                        Xp.log(TAG + c.getPackageName() + " carries no bitmap, reading its artwork"
+                                + " URI (" + uri + ")");
+                        return null;
+                    }
+                }
+                if (sessionBits != null) sessionBits[0] = -2;
+                Xp.log(TAG + c.getPackageName() + " carries no art bitmap (uri=" + uri + ")");
             }
         }
         if (!allowCard) return null;
         return cardThumbnail();
+    }
+
+    /**
+     * The one URI worth reading for this track: the album art's, or - when a player sets only
+     * that - the general artwork's. Not the display icon: that is a notification's icon in most
+     * players here, and a 96px one blown up to a wallpaper is worse than the card's copy.
+     */
+    private static String artworkUri(MediaMetadata md) {
+        String u = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
+        if (u == null || u.isEmpty()) u = md.getString(MediaMetadata.METADATA_KEY_ART_URI);
+        return u == null || u.isEmpty() ? null : u;
     }
 
     /**
